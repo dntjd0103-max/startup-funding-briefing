@@ -36,8 +36,22 @@ QUERIES = [
     "시드 투자 유치",
     "프리A 투자 유치",
 ]
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
-BATCH_SIZE = 25
+# 앞의 모델이 바쁘거나(503) 없으면(404) 다음 모델로 자동 전환
+GEMINI_MODELS = [m for m in [
+    (os.environ.get("GEMINI_MODEL") or "").strip(),
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-flash-latest",
+    "gemini-2.0-flash",
+] if m]
+BATCH_SIZE = 40
+# 제목에 이 단어가 하나도 없으면 투자유치 기사가 아니라고 보고 AI에 보내지 않는다.
+FUNDING_WORDS = ["투자", "유치", "시리즈", "시드", "펀딩"]
+
+
+def env(name):
+    """Secrets에 실수로 들어간 공백·줄바꿈을 지운다."""
+    return (os.environ.get(name) or "").strip()
 
 
 # ---------- 1. 뉴스 수집 ----------
@@ -82,6 +96,8 @@ def collect_news(hours):
             print(f"[경고] '{q}' 수집 실패: {e}")
             continue
         for it in items:
+            if not any(w in it["title"] for w in FUNDING_WORDS):
+                continue
             key = normalize(it["title"])
             if key in seen or (it["published"] and it["published"] < cutoff):
                 continue
@@ -113,34 +129,60 @@ PROMPT = """너는 벤처캐피털의 리서치 보조다. 아래 뉴스 제목 
 """
 
 
+_working_model = None  # 한 번 성공한 모델은 다음 배치에서도 먼저 쓴다
+
+
 def call_gemini(prompt, api_key):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    global _working_model
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
     }
-    for attempt in range(3):
-        resp = requests.post(url, params={"key": api_key}, json=body, timeout=120)
-        if resp.status_code in (429, 500, 503) and attempt < 2:
-            time.sleep(10 * (attempt + 1))
-            continue
-        resp.raise_for_status()
-        text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-        return json.loads(text)
-    return []
+    models = ([_working_model] if _working_model else []) + \
+             [m for m in GEMINI_MODELS if m != _working_model]
+    last_error = None
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        for attempt in range(2):
+            try:
+                resp = requests.post(url, params={"key": api_key}, json=body, timeout=90)
+            except requests.RequestException as e:  # 응답 지연 등
+                last_error = e
+                time.sleep(5)
+                continue
+            if resp.status_code == 404:  # 모델 이름이 없어졌으면 바로 다음 모델로
+                last_error = f"{model}: 404"
+                break
+            if resp.status_code in (429, 500, 503):
+                last_error = f"{model}: {resp.status_code}"
+                time.sleep(8 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            if _working_model != model:
+                print(f"사용 모델: {model}")
+            _working_model = model
+            return json.loads(text)
+    raise RuntimeError(f"모든 모델 실패 (마지막 오류: {last_error})")
 
 
 def extract_deals(news, api_key):
-    deals = []
+    deals, failed, total = [], 0, 0
     for start in range(0, len(news), BATCH_SIZE):
+        total += 1
         batch = news[start:start + BATCH_SIZE]
         listing = "\n".join(f"{start + i}. {n['title']} ({n['source']})" for i, n in enumerate(batch))
         try:
             results = call_gemini(PROMPT.format(items=listing), api_key)
         except Exception as e:
             print(f"[경고] AI 추출 실패: {e}")
+            failed += 1
             continue
+        if isinstance(results, dict):  # 가끔 {"deals": [...]} 형태로 돌려줄 때
+            results = next((v for v in results.values() if isinstance(v, list)), [])
         for r in results:
+            if not isinstance(r, dict):
+                continue
             idx = r.get("id")
             if not isinstance(idx, int) or not (0 <= idx < len(news)):
                 continue
@@ -151,7 +193,7 @@ def extract_deals(news, api_key):
             r["date"] = (article["published"] or datetime.now(KST)).strftime("%Y-%m-%d")
             r["check"] = verify(r)
             deals.append(r)
-    return dedupe(deals)
+    return dedupe(deals), failed, total
 
 
 def verify(deal):
@@ -292,25 +334,36 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = env("GEMINI_API_KEY")
     if not api_key:
         raise SystemExit("GEMINI_API_KEY가 설정되지 않았습니다.")
 
     today = datetime.now(KST).strftime("%Y-%m-%d")
     news = collect_news(args.hours)
-    print(f"수집한 기사 {len(news)}건")
-    deals = extract_deals(news, api_key)
+    print(f"수집한 투자 관련 기사 {len(news)}건")
+    deals, failed, total = extract_deals(news, api_key)
     message = format_message(deals, today)
+    if failed:
+        message += (f"\n\n⚠️ AI 분석 {total}묶음 중 {failed}묶음이 실패했습니다 "
+                    "(구글 서버 혼잡). 결과가 일부 빠졌을 수 있습니다.")
     print(message)
 
     if args.dry_run:
         return
     save_files(deals, message, today)
-    token = os.environ.get("TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID")
+
+    token = env("TELEGRAM_TOKEN") or env("TELEGRAM_BOT_TOKEN")
+    chat_id = env("CHAT_ID") or env("TELEGRAM_CHAT_ID")
     if token and chat_id:
-        send_telegram(message, token, chat_id)
-    notion_token, notion_db = os.environ.get("NOTION_TOKEN"), os.environ.get("NOTION_DATABASE_ID")
+        try:
+            send_telegram(message, token, chat_id)
+        except requests.HTTPError as e:
+            # 기록은 저장되도록 여기서 멈추지 않는다
+            print(f"[오류] 텔레그램 전송 실패: {e.response.status_code} {e.response.text[:200]}")
+    else:
+        print("[경고] TELEGRAM_TOKEN 또는 CHAT_ID가 비어 있습니다.")
+
+    notion_token, notion_db = env("NOTION_TOKEN"), env("NOTION_DATABASE_ID")
     if notion_token and notion_db:
         save_notion(deals, notion_token, notion_db)
 
