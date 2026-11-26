@@ -39,10 +39,10 @@ QUERIES = [
 # 앞의 모델이 바쁘거나(503) 없으면(404) 다음 모델로 자동 전환
 GEMINI_MODELS = [m for m in [
     (os.environ.get("GEMINI_MODEL") or "").strip(),
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-flash-latest",
-    "gemini-2.0-flash",
 ] if m]
 BATCH_SIZE = 40
 # 제목에 이 단어가 하나도 없으면 투자유치 기사가 아니라고 보고 AI에 보내지 않는다.
@@ -130,6 +130,35 @@ PROMPT = """너는 벤처캐피털의 리서치 보조다. 아래 뉴스 제목 
 
 
 _working_model = None  # 한 번 성공한 모델은 다음 배치에서도 먼저 쓴다
+_model_list = None
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+
+def available_models(api_key):
+    """이 API 키로 지금 쓸 수 있는 Flash 계열 모델을 구글에 직접 물어본다."""
+    global _model_list
+    if _model_list is not None:
+        return _model_list
+    found = []
+    try:
+        resp = requests.get(f"{GEMINI_BASE}/models", params={"key": api_key, "pageSize": 200}, timeout=30)
+        if resp.status_code >= 400:
+            print(f"[경고] 모델 목록 조회 실패: {resp.status_code} {resp.text[:200]}")
+        else:
+            for m in resp.json().get("models", []):
+                name = m.get("name", "").replace("models/", "")
+                methods = m.get("supportedGenerationMethods", [])
+                if ("generateContent" in methods and "flash" in name
+                        and not any(x in name for x in ("image", "tts", "audio", "live", "embedding", "exp"))):
+                    found.append(name)
+    except requests.RequestException as e:
+        print(f"[경고] 모델 목록 조회 실패: {e}")
+    # 미리 정한 순서를 먼저, 그다음 목록에 있는 나머지 Flash 모델 (최신 이름 순)
+    preferred = [m for m in GEMINI_MODELS if not found or m in found]
+    rest = sorted((m for m in found if m not in preferred), reverse=True)
+    _model_list = preferred + rest
+    print(f"사용 가능한 모델 후보: {', '.join(_model_list[:6])}")
+    return _model_list
 
 
 def call_gemini(prompt, api_key):
@@ -138,32 +167,39 @@ def call_gemini(prompt, api_key):
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
     }
+    candidates = available_models(api_key)
     models = ([_working_model] if _working_model else []) + \
-             [m for m in GEMINI_MODELS if m != _working_model]
-    last_error = None
-    for model in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+             [m for m in candidates if m != _working_model]
+    errors = []
+    for model in models[:6]:
+        url = f"{GEMINI_BASE}/models/{model}:generateContent"
         for attempt in range(2):
             try:
                 resp = requests.post(url, params={"key": api_key}, json=body, timeout=90)
             except requests.RequestException as e:  # 응답 지연 등
-                last_error = e
+                errors.append(f"{model}: {type(e).__name__}")
                 time.sleep(5)
                 continue
             if resp.status_code == 404:  # 모델 이름이 없어졌으면 바로 다음 모델로
-                last_error = f"{model}: 404"
+                errors.append(f"{model}: 404")
                 break
             if resp.status_code in (429, 500, 503):
-                last_error = f"{model}: {resp.status_code}"
+                errors.append(f"{model}: {resp.status_code}")
                 time.sleep(8 * (attempt + 1))
                 continue
-            resp.raise_for_status()
-            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            if resp.status_code >= 400:  # 400/403 = 키 문제일 가능성
+                raise RuntimeError(f"{model}: {resp.status_code} {resp.text[:200]}")
+            data = resp.json()
+            try:
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+            except (KeyError, IndexError):
+                errors.append(f"{model}: 빈 응답")
+                break
             if _working_model != model:
                 print(f"사용 모델: {model}")
             _working_model = model
             return json.loads(text)
-    raise RuntimeError(f"모든 모델 실패 (마지막 오류: {last_error})")
+    raise RuntimeError("모든 모델 실패 → " + ", ".join(errors))
 
 
 def extract_deals(news, api_key):
@@ -177,6 +213,9 @@ def extract_deals(news, api_key):
         except Exception as e:
             print(f"[경고] AI 추출 실패: {e}")
             failed += 1
+            fallback = rule_extract(batch)
+            print(f"  → 예비 모드(규칙 추출)로 {len(fallback)}건 정리")
+            deals.extend(fallback)
             continue
         if isinstance(results, dict):  # 가끔 {"deals": [...]} 형태로 돌려줄 때
             results = next((v for v in results.values() if isinstance(v, list)), [])
@@ -203,6 +242,50 @@ def extract_deals(news, api_key):
             r["check"] = verify(r)
             deals.append(r)
     return dedupe(deals), failed, total
+
+
+STAGE_PATTERNS = [
+    ("프리시리즈A", "프리A"), ("프리A", "프리A"), ("프리 A", "프리A"), ("프리시드", "시드"), ("시드", "시드"),
+    ("시리즈A", "시리즈A"), ("시리즈 A", "시리즈A"), ("시리즈B", "시리즈B"), ("시리즈 B", "시리즈B"),
+    ("시리즈C", "시리즈C 이상"), ("시리즈D", "시리즈C 이상"), ("브릿지", "브릿지"), ("전략적 투자", "전략적 투자"),
+]
+AMOUNT_RE = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(조|억|만\s*달러|달러|만\s*유로|유로)")
+# 투자유치가 아닌 기사에 자주 나오는 단어
+NOT_DEAL_WORDS = ["센터", "지원사업", "모집", "공고", "펀드 결성", "출자", "세미나", "데모데이", "설명회", "프로그램"]
+
+
+def rule_extract(batch):
+    """AI가 실패했을 때 쓰는 예비 모드: 제목에서 단계·금액·기업명을 규칙으로 뽑는다."""
+    results = []
+    for n in batch:
+        t = n["title"]
+        if "유치" not in t or any(w in t for w in NOT_DEAL_WORDS):
+            continue
+        stage = next((s for p, s in STAGE_PATTERNS if p in t), None)
+        amount, converted = None, False
+        m = AMOUNT_RE.search(t)
+        if m:
+            num, unit = float(m.group(1).replace(",", "")), m.group(2).replace(" ", "")
+            amount = {"조": num * 10000, "억": num, "만달러": num * 0.14, "달러": num * 1400 / 1e8,
+                      "만유로": num * 0.15, "유로": num * 1500 / 1e8}[unit]
+            converted = "달러" in unit or "유로" in unit
+        if not stage and amount is None:
+            continue
+        # 보통 '기업명, ...' 또는 '기업명 ... 유치' 형태라 첫 쉼표 앞을 기업명으로 본다
+        head = re.split(r"[,，…·]", t)[0]
+        head = re.sub(r"^\s*(\[[^\]]*\]|'[^']*'|\"[^\"]*\"|‘[^’]*’)\s*", "", head).strip()
+        words = head.split()
+        company = words[-1] if words else None
+        results.append({
+            "company": company, "sector": None, "stage": stage,
+            "amount_krw_100m": round(amount, 1) if amount else None, "converted": converted,
+            "investors": None, "summary": "(예비 모드: AI 없이 제목에서 자동 추출)",
+            "title": t, "link": n["link"], "source": n["source"],
+            "date": (n["published"] or datetime.now(KST)).strftime("%Y-%m-%d"),
+        })
+    for r in results:
+        r["check"] = "규칙추출" if verify(r) == "OK" else "확인필요"
+    return results
 
 
 def verify(deal):
@@ -355,8 +438,8 @@ def main():
     deals, failed, total = extract_deals(news, api_key)
     message = format_message(deals, today)
     if failed:
-        message += (f"\n\n⚠️ AI 분석 {total}묶음 중 {failed}묶음이 실패했습니다 "
-                    "(구글 서버 혼잡). 결과가 일부 빠졌을 수 있습니다.")
+        message += (f"\n\n⚠️ AI 분석 {total}묶음 중 {failed}묶음이 실패해 "
+                    "해당 기사는 예비 모드(제목 규칙 추출)로 정리했습니다. 업종·투자사가 비어 있을 수 있습니다.")
     print(message)
 
     if args.dry_run:
