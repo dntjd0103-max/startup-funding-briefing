@@ -180,13 +180,22 @@ def extract_deals(news, api_key):
             continue
         if isinstance(results, dict):  # 가끔 {"deals": [...]} 형태로 돌려줄 때
             results = next((v for v in results.values() if isinstance(v, list)), [])
-        for r in results:
+        print(f"  AI 응답 {len(results) if isinstance(results, list) else 0}건 (기사 {start}~{start + len(batch) - 1}번)")
+        for r in results if isinstance(results, list) else []:
             if not isinstance(r, dict):
                 continue
-            idx = r.get("id")
-            if not isinstance(idx, int) or not (0 <= idx < len(news)):
+            try:  # AI가 번호를 "3", 3.0처럼 돌려줘도 받아들인다
+                idx = int(float(str(r.get("id")).strip()))
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= idx < len(news)):
                 continue
             article = news[idx]
+            try:  # 금액이 "50", "50억" 같은 글자로 와도 숫자로 정리
+                amt = r.get("amount_krw_100m")
+                r["amount_krw_100m"] = float(re.sub(r"[^0-9.]", "", str(amt))) if amt not in (None, "", "null") else None
+            except ValueError:
+                r["amount_krw_100m"] = None
             r["title"] = article["title"]
             r["link"] = article["link"]
             r["source"] = article["source"]
@@ -341,6 +350,8 @@ def main():
     today = datetime.now(KST).strftime("%Y-%m-%d")
     news = collect_news(args.hours)
     print(f"수집한 투자 관련 기사 {len(news)}건")
+    for n in news[:5]:
+        print(f"  예시: {n['title']}")
     deals, failed, total = extract_deals(news, api_key)
     message = format_message(deals, today)
     if failed:
